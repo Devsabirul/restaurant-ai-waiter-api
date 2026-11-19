@@ -1,0 +1,28 @@
+[project]
+name = "ai-menu-assistant"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.165.0",
+    "langchain>=1.5.2",
+    "langchain-community>=0.4.2",
+    "langchain-groq>=1.2.1",
+    "langchain-huggingface>=1.2.3",
+    "langchain-pinecone>=0.2.13",
+    "langchain-text-splitters>=1.1.3",
+    "pinecone>=7.3.0",
+    "pypdf>=7.1.1",
+    "python-dotenv>=1.2.4",
+    "python-multipart>=0.0.34",
+    "sentence-transformers>=6.3.0",
+    "uvicorn>=0.54.0",
+]
+
+[project.scripts]
+ai-menu-assistant = "ai_menu_assistant:main"
+
+[build-system]
+requires = ["uv_build>=0.12.15,<0.13.0"]
+build-backend = "uv_build"
