@@ -1,12 +1,19 @@
-
 import os
 import re
 import uuid
 import time
 import tempfile
+from typing import Annotated, TypedDict
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import (
+    FastAPI,
+    UploadFile,
+    File,
+    Form,
+    HTTPException,
+    Request
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -23,7 +30,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_pinecone import PineconeVectorStore
 
 from langchain_core.messages import SystemMessage, HumanMessage
-from langgraph.graph import StateGraph, MessagesState, START
+from langgraph.graph import StateGraph, START
+from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import InMemorySaver
 
 
@@ -35,7 +43,6 @@ load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
-
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 
 PINECONE_INDEX_NAME = os.getenv(
@@ -45,6 +52,27 @@ PINECONE_INDEX_NAME = os.getenv(
 
 PINECONE_CLOUD = os.getenv("PINECONE_CLOUD", "aws")
 PINECONE_REGION = os.getenv("PINECONE_REGION", "us-east-1")
+
+# Frontend origins: comma-separated URLs
+FRONTEND_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "FRONTEND_ORIGINS",
+        "http://localhost:5500,http://127.0.0.1:5500"
+    ).split(",")
+    if origin.strip()
+]
+
+# Cookie configuration
+COOKIE_SECURE = os.getenv(
+    "COOKIE_SECURE",
+    "true"
+).lower() == "true"
+
+COOKIE_SAMESITE = os.getenv(
+    "COOKIE_SAMESITE",
+    "none"
+).lower()
 
 
 # ==========================================
@@ -59,9 +87,22 @@ pinecone_index = None
 
 chat_graph = None
 
+app_ready = False
+
 
 # ==========================================
-# 3. INITIALIZE APPLICATION
+# 3. LANGGRAPH STATE
+# ==========================================
+
+class WaiterState(TypedDict):
+
+    messages: Annotated[list, add_messages]
+
+    system_prompt: str
+
+
+# ==========================================
+# 4. INITIALIZE APPLICATION
 # ==========================================
 
 @asynccontextmanager
@@ -72,10 +113,17 @@ async def lifespan(app: FastAPI):
     global pinecone_client
     global pinecone_index
     global chat_graph
+    global app_ready
 
-    print("Starting Restaurant AI Waiter API...")
+    app_ready = False
 
+    print("====================================")
+    print("Starting Restaurant AI Waiter API")
+    print("====================================")
+
+    # --------------------------------------
     # Check API keys
+    # --------------------------------------
 
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is missing!")
@@ -86,7 +134,9 @@ async def lifespan(app: FastAPI):
     if not PINECONE_API_KEY:
         raise RuntimeError("PINECONE_API_KEY is missing!")
 
-    # Initialize Cohere Embeddings
+    # --------------------------------------
+    # Initialize Cohere
+    # --------------------------------------
 
     print("Loading Cohere Embeddings...")
 
@@ -95,7 +145,11 @@ async def lifespan(app: FastAPI):
         cohere_api_key=COHERE_API_KEY
     )
 
-    # Initialize Groq LLM
+    print("Cohere Embeddings initialized!")
+
+    # --------------------------------------
+    # Initialize Groq
+    # --------------------------------------
 
     print("Loading Groq LLM...")
 
@@ -105,7 +159,11 @@ async def lifespan(app: FastAPI):
         api_key=GROQ_API_KEY
     )
 
+    print("Groq LLM initialized!")
+
+    # --------------------------------------
     # Initialize Pinecone
+    # --------------------------------------
 
     print("Connecting to Pinecone...")
 
@@ -113,14 +171,21 @@ async def lifespan(app: FastAPI):
         api_key=PINECONE_API_KEY
     )
 
-    existing_indexes = [
-        item["name"]
-        for item in pinecone_client.list_indexes()
-    ]
+    # Get existing indexes
+
+    existing_indexes = pinecone_client.list_indexes().names()
+
+    print("Existing indexes:", existing_indexes)
+
+    # Create index if not exists
 
     if PINECONE_INDEX_NAME not in existing_indexes:
 
-        print("Creating Pinecone Index...")
+        print(
+            f"Index '{PINECONE_INDEX_NAME}' does not exist."
+        )
+
+        print("Creating Pinecone index...")
 
         pinecone_client.create_index(
             name=PINECONE_INDEX_NAME,
@@ -132,63 +197,136 @@ async def lifespan(app: FastAPI):
             )
         )
 
-    # Wait for Pinecone index
+        print("Index creation request submitted!")
 
-    for attempt in range(30):
+    else:
 
-        index_description = pinecone_client.describe_index(
-            PINECONE_INDEX_NAME
+        print(
+            f"Index '{PINECONE_INDEX_NAME}' already exists."
         )
 
-        if index_description.status["ready"]:
-            break
+    # --------------------------------------
+    # Wait for index readiness
+    # --------------------------------------
 
-        print("Waiting for Pinecone Index...")
+    print("Waiting for Pinecone index readiness...")
+
+    index_description = None
+
+    for attempt in range(90):
+
+        try:
+
+            index_description = pinecone_client.describe_index(
+                PINECONE_INDEX_NAME
+            )
+
+            if index_description.status["ready"]:
+
+                print("Pinecone control-plane: READY")
+
+                break
+
+            print(
+                f"Index is not ready. "
+                f"Attempt {attempt + 1}/90"
+            )
+
+        except Exception as error:
+
+            print(
+                f"Index check failed: {repr(error)}"
+            )
 
         time.sleep(2)
 
     else:
-        raise RuntimeError("Pinecone Index is not ready!")
 
-    # Connect to index
+        raise RuntimeError(
+            "Pinecone index did not become ready "
+            "within 180 seconds."
+        )
 
-    pinecone_index = pinecone_client.Index(
-        PINECONE_INDEX_NAME
-    )
-
-    # Check dimension
-
-    index_description = pinecone_client.describe_index(
-        PINECONE_INDEX_NAME
-    )
+    # --------------------------------------
+    # Check index dimension
+    # --------------------------------------
 
     if index_description.dimension != 1024:
 
         raise RuntimeError(
             f"Wrong Pinecone dimension: "
             f"{index_description.dimension}. "
-            f"Expected 1024."
+            f"Expected: 1024."
         )
 
-    # ==========================================
+    # --------------------------------------
+    # Connect to Pinecone index
+    # --------------------------------------
+
+    pinecone_index = pinecone_client.Index(
+        PINECONE_INDEX_NAME
+    )
+
+    print("Pinecone index object created!")
+
+    # --------------------------------------
+    # Test data-plane connection
+    # --------------------------------------
+
+    print("Testing Pinecone data-plane connection...")
+
+    for attempt in range(30):
+
+        try:
+
+            stats = pinecone_index.describe_index_stats()
+
+            print("Pinecone connection successful!")
+
+            print("Pinecone index statistics:", stats)
+
+            break
+
+        except Exception as error:
+
+            print(
+                f"Data-plane connection failed. "
+                f"Attempt {attempt + 1}/30: {repr(error)}"
+            )
+
+            time.sleep(2)
+
+    else:
+
+        raise RuntimeError(
+            "Pinecone data-plane is not accessible. "
+            "Check API key, project and index configuration."
+        )
+
+    # ======================================
     # LANGGRAPH MEMORY
-    # ==========================================
+    # ======================================
 
     print("Initializing LangGraph Memory...")
 
     memory = InMemorySaver()
 
-    def chatbot(state: MessagesState):
+    def chatbot(state: WaiterState):
 
-        response = llm.invoke(
-            state["messages"]
-        )
+        # System prompt is used for this request,
+        # but is NOT stored inside conversation messages.
+
+        messages = [
+            SystemMessage(content=state["system_prompt"])
+        ] + state["messages"]
+
+        response = llm.invoke(messages)
 
         return {
             "messages": [response]
         }
 
-    builder = StateGraph(MessagesState)
+    builder = StateGraph(WaiterState)
 
     builder.add_node("chatbot", chatbot)
 
@@ -200,15 +338,25 @@ async def lifespan(app: FastAPI):
 
     print("LangGraph Memory initialized!")
 
-    print("Restaurant AI Waiter API is ready!")
+    # --------------------------------------
+    # Application ready
+    # --------------------------------------
+
+    app_ready = True
+
+    print("====================================")
+    print("Restaurant AI Waiter API is READY!")
+    print("====================================")
 
     yield
+
+    app_ready = False
 
     print("Shutting down API...")
 
 
 # ==========================================
-# 4. FASTAPI APPLICATION
+# 5. FASTAPI APPLICATION
 # ==========================================
 
 app = FastAPI(
@@ -220,12 +368,12 @@ app = FastAPI(
 
 
 # ==========================================
-# 5. CORS
+# 6. CORS
 # ==========================================
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=FRONTEND_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
@@ -233,7 +381,7 @@ app.add_middleware(
 
 
 # ==========================================
-# 6. CHAT REQUEST MODEL
+# 7. CHAT REQUEST MODEL
 # ==========================================
 
 class ChatRequest(BaseModel):
@@ -245,7 +393,7 @@ class ChatRequest(BaseModel):
 
 
 # ==========================================
-# 7. TEXT CLEANING FUNCTION
+# 8. TEXT CLEANING FUNCTION
 # ==========================================
 
 def clean_documents(documents):
@@ -271,7 +419,7 @@ def clean_documents(documents):
 
 
 # ==========================================
-# 8. RESTAURANT MENU UPLOAD API
+# 9. RESTAURANT MENU UPLOAD API
 # ==========================================
 
 @app.post("/api/restaurants/upload")
@@ -282,6 +430,13 @@ async def upload_restaurant_menu(
     file: UploadFile = File(...)
 
 ):
+
+    if not app_ready or pinecone_index is None:
+
+        raise HTTPException(
+            status_code=503,
+            detail="API is not ready. Please try again later."
+        )
 
     restaurant_name = restaurant_name.strip()
 
@@ -319,11 +474,18 @@ async def upload_restaurant_menu(
 
     try:
 
+        # ----------------------------------
         # Generate restaurant ID
+        # ----------------------------------
 
         restaurant_id = "rest_" + uuid.uuid4().hex[:12]
 
+        print("New restaurant:", restaurant_name)
+        print("Restaurant ID:", restaurant_id)
+
+        # ----------------------------------
         # Save temporary PDF
+        # ----------------------------------
 
         with tempfile.NamedTemporaryFile(
             delete=False,
@@ -334,7 +496,11 @@ async def upload_restaurant_menu(
 
             temp_file_path = temp_file.name
 
+        # ----------------------------------
         # Load PDF
+        # ----------------------------------
+
+        print("Loading PDF...")
 
         loader = PyPDFLoader(temp_file_path)
 
@@ -349,7 +515,11 @@ async def upload_restaurant_menu(
 
         total_pages = len(documents)
 
+        print("Total PDF pages:", total_pages)
+
+        # ----------------------------------
         # Clean documents
+        # ----------------------------------
 
         documents = clean_documents(documents)
 
@@ -360,7 +530,9 @@ async def upload_restaurant_menu(
                 detail="Could not extract readable text from PDF."
             )
 
+        # ----------------------------------
         # Split documents
+        # ----------------------------------
 
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=500,
@@ -376,7 +548,11 @@ async def upload_restaurant_menu(
                 detail="Could not create menu text chunks."
             )
 
+        print("Total chunks:", len(chunks))
+
+        # ----------------------------------
         # Add metadata
+        # ----------------------------------
 
         for chunk in chunks:
 
@@ -384,7 +560,11 @@ async def upload_restaurant_menu(
 
             chunk.metadata["restaurant_name"] = restaurant_name
 
+        # ----------------------------------
         # Store in Pinecone
+        # ----------------------------------
+
+        print("Creating Pinecone vector store...")
 
         vector_store = PineconeVectorStore(
             index=pinecone_index,
@@ -392,7 +572,11 @@ async def upload_restaurant_menu(
             namespace=restaurant_id
         )
 
+        print("Uploading vectors to Pinecone...")
+
         vector_store.add_documents(chunks)
+
+        print("PDF uploaded successfully!")
 
         return {
 
@@ -426,11 +610,14 @@ async def upload_restaurant_menu(
 
     except Exception as error:
 
-        print("Upload Error:", str(error))
+        print("====================================")
+        print("UPLOAD ERROR TYPE:", type(error).__name__)
+        print("UPLOAD ERROR DETAILS:", repr(error))
+        print("====================================")
 
         raise HTTPException(
             status_code=500,
-            detail="Menu upload failed. Please try again."
+            detail="Menu upload failed. Please check server logs."
         )
 
     finally:
@@ -439,9 +626,11 @@ async def upload_restaurant_menu(
 
             os.remove(temp_file_path)
 
+        await file.close()
+
 
 # ==========================================
-# 9. GET OR CREATE CUSTOMER SESSION
+# 10. GET OR CREATE CUSTOMER SESSION
 # ==========================================
 
 @app.post("/api/chat/{restaurant_id}/session")
@@ -453,9 +642,16 @@ async def create_chat_session(
 
 ):
 
-    session_id = request.cookies.get("restaurant_chat_session")
+    if not app_ready:
 
-    # Create new session if cookie does not exist
+        raise HTTPException(
+            status_code=503,
+            detail="API is not ready."
+        )
+
+    session_id = request.cookies.get(
+        "restaurant_chat_session"
+    )
 
     if not session_id:
 
@@ -473,8 +669,6 @@ async def create_chat_session(
 
     })
 
-    # Store session in browser cookie
-
     response.set_cookie(
 
         key="restaurant_chat_session",
@@ -483,11 +677,13 @@ async def create_chat_session(
 
         httponly=True,
 
-        secure=False,  # Set True when using HTTPS
+        secure=COOKIE_SECURE,
 
-        samesite="lax",
+        samesite=COOKIE_SAMESITE,
 
-        max_age=86400
+        max_age=86400,
+
+        path="/"
 
     )
 
@@ -495,7 +691,7 @@ async def create_chat_session(
 
 
 # ==========================================
-# 10. RESTAURANT CHAT API WITH MEMORY
+# 11. RESTAURANT CHAT API WITH MEMORY
 # ==========================================
 
 @app.post("/api/chat/{restaurant_id}")
@@ -509,6 +705,13 @@ async def restaurant_chat(
 
 ):
 
+    if not app_ready:
+
+        raise HTTPException(
+            status_code=503,
+            detail="API is not ready."
+        )
+
     try:
 
         question = request.question.strip()
@@ -520,13 +723,13 @@ async def restaurant_chat(
                 detail="Question cannot be empty."
             )
 
-        # Get session from cookie
+        # ----------------------------------
+        # Get customer session
+        # ----------------------------------
 
         session_id = http_request.cookies.get(
             "restaurant_chat_session"
         )
-
-        # Require session initialization first
 
         if not session_id:
 
@@ -535,7 +738,9 @@ async def restaurant_chat(
                 detail="Chat session not found. Please start a new chat."
             )
 
+        # ----------------------------------
         # Connect to restaurant namespace
+        # ----------------------------------
 
         vector_store = PineconeVectorStore(
 
@@ -547,7 +752,9 @@ async def restaurant_chat(
 
         )
 
+        # ----------------------------------
         # Search menu information
+        # ----------------------------------
 
         relevant_documents = vector_store.similarity_search(
 
@@ -557,7 +764,9 @@ async def restaurant_chat(
 
         )
 
+        # ----------------------------------
         # Prepare context
+        # ----------------------------------
 
         context = "\n\n".join(
 
@@ -567,11 +776,15 @@ async def restaurant_chat(
 
         )
 
+        if not context:
+
+            context = "No relevant menu information was found."
+
+        # ----------------------------------
         # System prompt
+        # ----------------------------------
 
-        system_message = SystemMessage(
-
-            content=f"""
+        system_prompt = f"""
 
 You are a friendly, professional, and welcoming AI waiter
 working at a restaurant.
@@ -616,9 +829,9 @@ MENU CONTEXT:
 
 """
 
-        )
-
+        # ----------------------------------
         # LangGraph memory configuration
+        # ----------------------------------
 
         config = {
 
@@ -630,15 +843,17 @@ MENU CONTEXT:
 
         }
 
-        # Generate AI response with conversation memory
+        # ----------------------------------
+        # Generate AI response
+        # ----------------------------------
 
         result = chat_graph.invoke(
 
             {
 
-                "messages": [
+                "system_prompt": system_prompt,
 
-                    system_message,
+                "messages": [
 
                     HumanMessage(content=question)
 
@@ -672,16 +887,19 @@ MENU CONTEXT:
 
     except Exception as error:
 
-        print("Chat Error:", str(error))
+        print("====================================")
+        print("CHAT ERROR TYPE:", type(error).__name__)
+        print("CHAT ERROR DETAILS:", repr(error))
+        print("====================================")
 
         raise HTTPException(
             status_code=500,
-            detail="Something went wrong. Please try again."
+            detail="Something went wrong. Please check server logs."
         )
 
 
 # ==========================================
-# 11. ROOT API
+# 12. ROOT API
 # ==========================================
 
 @app.get("/")
@@ -699,7 +917,7 @@ def home():
 
 
 # ==========================================
-# 12. HEALTH CHECK
+# 13. HEALTH CHECK
 # ==========================================
 
 @app.get("/health")
@@ -707,8 +925,10 @@ def health_check():
 
     return {
 
-        "status": "healthy",
+        "status": "healthy" if app_ready else "starting",
 
-        "service": "Restaurant AI Waiter API"
+        "service": "Restaurant AI Waiter API",
+
+        "pinecone_connected": pinecone_index is not None
 
     }
