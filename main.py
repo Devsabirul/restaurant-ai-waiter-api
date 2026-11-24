@@ -1,3 +1,4 @@
+
 import os
 import re
 import uuid
@@ -5,7 +6,6 @@ import time
 import tempfile
 from typing import Annotated, TypedDict
 from contextlib import asynccontextmanager
-
 
 from fastapi import (
     FastAPI,
@@ -16,7 +16,6 @@ from fastapi import (
     Request
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -54,7 +53,6 @@ PINECONE_INDEX_NAME = os.getenv(
 PINECONE_CLOUD = os.getenv("PINECONE_CLOUD", "aws")
 PINECONE_REGION = os.getenv("PINECONE_REGION", "us-east-1")
 
-# Frontend origins: comma-separated URLs
 FRONTEND_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
@@ -63,17 +61,6 @@ FRONTEND_ORIGINS = [
     ).split(",")
     if origin.strip()
 ]
-
-# Cookie configuration
-COOKIE_SECURE = os.getenv(
-    "COOKIE_SECURE",
-    "true"
-).lower() == "true"
-
-COOKIE_SAMESITE = os.getenv(
-    "COOKIE_SAMESITE",
-    "none"
-).lower()
 
 
 # ==========================================
@@ -172,13 +159,9 @@ async def lifespan(app: FastAPI):
         api_key=PINECONE_API_KEY
     )
 
-    # Get existing indexes
-
     existing_indexes = pinecone_client.list_indexes().names()
 
     print("Existing indexes:", existing_indexes)
-
-    # Create index if not exists
 
     if PINECONE_INDEX_NAME not in existing_indexes:
 
@@ -313,9 +296,6 @@ async def lifespan(app: FastAPI):
     memory = InMemorySaver()
 
     def chatbot(state: WaiterState):
-
-        # System prompt is used for this request,
-        # but is NOT stored inside conversation messages.
 
         messages = [
             SystemMessage(content=state["system_prompt"])
@@ -631,68 +611,7 @@ async def upload_restaurant_menu(
 
 
 # ==========================================
-# 10. GET OR CREATE CUSTOMER SESSION
-# ==========================================
-
-@app.post("/api/chat/{restaurant_id}/session")
-async def create_chat_session(
-
-    restaurant_id: str,
-
-    request: Request
-
-):
-
-    if not app_ready:
-
-        raise HTTPException(
-            status_code=503,
-            detail="API is not ready."
-        )
-
-    session_id = request.cookies.get(
-        "restaurant_chat_session"
-    )
-
-    if not session_id:
-
-        session_id = uuid.uuid4().hex
-
-    response = JSONResponse({
-
-        "success": True,
-
-        "restaurant_id": restaurant_id,
-
-        "session_id": session_id,
-
-        "message": "Chat session is ready."
-
-    })
-
-    response.set_cookie(
-
-        key="restaurant_chat_session",
-
-        value=session_id,
-
-        httponly=True,
-
-        secure=COOKIE_SECURE,
-
-        samesite=COOKIE_SAMESITE,
-
-        max_age=86400,
-
-        path="/"
-
-    )
-
-    return response
-
-
-# ==========================================
-# 11. RESTAURANT CHAT API WITH MEMORY
+# 10. RESTAURANT CHAT API WITH AUTO SESSION
 # ==========================================
 
 @app.post("/api/chat/{restaurant_id}")
@@ -725,19 +644,27 @@ async def restaurant_chat(
             )
 
         # ----------------------------------
-        # Get customer session
+        # Get or Create Customer Session
         # ----------------------------------
 
-        session_id = http_request.cookies.get(
-            "restaurant_chat_session"
+        session_id = http_request.headers.get(
+            "X-Chat-Session-ID"
         )
 
-        if not session_id:
+        if session_id:
 
-            raise HTTPException(
-                status_code=401,
-                detail="Chat session not found. Please start a new chat."
-            )
+            if not re.fullmatch(r"[a-f0-9]{32}", session_id):
+
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid chat session ID."
+                )
+
+        else:
+
+            session_id = uuid.uuid4().hex
+
+            print("New chat session created:", session_id)
 
         # ----------------------------------
         # Connect to restaurant namespace
@@ -868,6 +795,10 @@ MENU CONTEXT:
 
         answer = result["messages"][-1].content
 
+        # ----------------------------------
+        # API Response
+        # ----------------------------------
+
         return {
 
             "success": True,
@@ -900,7 +831,7 @@ MENU CONTEXT:
 
 
 # ==========================================
-# 12. ROOT API
+# 11. ROOT API
 # ==========================================
 
 @app.get("/")
@@ -918,7 +849,7 @@ def home():
 
 
 # ==========================================
-# 13. HEALTH CHECK
+# 12. HEALTH CHECK
 # ==========================================
 
 @app.get("/health")
